@@ -250,3 +250,89 @@
     (ok balance)
   )
 )
+
+
+(define-map retailer-ratings
+  { retailer: principal }
+  { 
+    total-score: uint,
+    rating-count: uint
+  }
+)
+
+(define-read-only (get-retailer-rating (retailer principal))
+  (default-to
+    { total-score: u0, rating-count: u0 }
+    (map-get? retailer-ratings { retailer: retailer })
+  )
+)
+
+(define-public (rate-retailer (retailer principal) (score uint))
+  (let
+    (
+      (current-rating (get-retailer-rating retailer))
+      (total-score (get total-score current-rating))
+      (rating-count (get rating-count current-rating))
+    )
+    (asserts! (<= score u5) err-invalid-amount)
+    (asserts! (> score u0) err-invalid-amount)
+    (map-set retailer-ratings
+      { retailer: retailer }
+      {
+        total-score: (+ total-score score),
+        rating-count: (+ rating-count u1)
+      }
+    )
+    (ok true)
+  )
+)
+
+
+
+(define-constant err-no-dispute (err u109))
+
+(define-map invoice-disputes
+  { invoice-id: uint }
+  {
+    supplier: principal,
+    reason: (string-ascii 50),
+    status: (string-ascii 20),
+    resolution: (optional (string-ascii 50))
+  }
+)
+
+(define-public (raise-dispute (invoice-id uint) (reason (string-ascii 50)))
+  (let
+    (
+      (invoice (unwrap! (map-get? invoices { invoice-id: invoice-id }) err-not-found))
+    )
+    (asserts! (is-eq tx-sender (get supplier invoice)) err-unauthorized)
+    (map-set invoice-disputes
+      { invoice-id: invoice-id }
+      {
+        supplier: tx-sender,
+        reason: reason,
+        status: "open",
+        resolution: none
+      }
+    )
+    (ok true)
+  )
+)
+
+(define-public (resolve-dispute (invoice-id uint) (resolution (string-ascii 50)))
+  (let
+    (
+      (dispute (unwrap! (map-get? invoice-disputes { invoice-id: invoice-id }) err-no-dispute))
+    )
+    (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+    (map-set invoice-disputes
+      { invoice-id: invoice-id }
+      (merge dispute {
+        status: "resolved",
+        resolution: (some resolution)
+      })
+    )
+    (ok true)
+  )
+)
