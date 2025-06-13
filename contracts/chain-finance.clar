@@ -336,3 +336,167 @@
     (ok true)
   )
 )
+
+
+(define-map retailer-payment-accounts
+  { retailer: principal }
+  { balance: uint }
+)
+
+(define-map auto-payment-settings
+  { retailer: principal }
+  { enabled: bool }
+)
+
+(define-map scheduled-payments
+  { invoice-id: uint }
+  { 
+    amount: uint,
+    due-block: uint,
+    processed: bool
+  }
+)
+
+(define-read-only (get-payment-account-balance (retailer principal))
+  (default-to
+    { balance: u0 }
+    (map-get? retailer-payment-accounts { retailer: retailer })
+  )
+)
+
+(define-read-only (get-auto-payment-status (retailer principal))
+  (default-to
+    { enabled: false }
+    (map-get? auto-payment-settings { retailer: retailer })
+  )
+)
+
+(define-read-only (get-scheduled-payment (invoice-id uint))
+  (map-get? scheduled-payments { invoice-id: invoice-id })
+)
+
+(define-public (deposit-to-payment-account (amount uint))
+  (begin
+    (asserts! (> amount u0) err-invalid-amount)
+    (map-set retailer-payment-accounts
+      { retailer: tx-sender }
+      { balance: (+ (get balance (get-payment-account-balance tx-sender)) amount) }
+    )
+    (ok amount)
+  )
+)
+
+(define-public (withdraw-from-payment-account (amount uint))
+  (let
+    (
+      (current-balance (get balance (get-payment-account-balance tx-sender)))
+    )
+    (asserts! (> amount u0) err-invalid-amount)
+    (asserts! (>= current-balance amount) err-insufficient-funds)
+    (map-set retailer-payment-accounts
+      { retailer: tx-sender }
+      { balance: (- current-balance amount) }
+    )
+    (ok amount)
+  )
+)
+
+(define-public (enable-auto-payments)
+  (begin
+    (map-set auto-payment-settings
+      { retailer: tx-sender }
+      { enabled: true }
+    )
+    (ok true)
+  )
+)
+
+(define-public (disable-auto-payments)
+  (begin
+    (map-set auto-payment-settings
+      { retailer: tx-sender }
+      { enabled: false }
+    )
+    (ok true)
+  )
+)
+
+(define-public (schedule-auto-payment (invoice-id uint))
+  (let
+    (
+      (invoice (unwrap! (map-get? invoices { invoice-id: invoice-id }) err-not-found))
+      (retailer (get retailer invoice))
+      (auto-payment-enabled (get enabled (get-auto-payment-status retailer)))
+    )
+    (asserts! (is-eq tx-sender retailer) err-unauthorized)
+    (asserts! auto-payment-enabled err-unauthorized)
+    (asserts! (is-eq (get status invoice) "registered") err-unauthorized)
+    (map-set scheduled-payments
+      { invoice-id: invoice-id }
+      {
+        amount: (get amount invoice),
+        due-block: (get due-date invoice),
+        processed: false
+      }
+    )
+    (map-set invoices
+      { invoice-id: invoice-id }
+      (merge invoice { status: "scheduled" })
+    )
+    (ok true)
+  )
+)
+
+(define-public (process-auto-payment (invoice-id uint))
+  (let
+    (
+      (invoice (unwrap! (map-get? invoices { invoice-id: invoice-id }) err-not-found))
+      (scheduled-payment (unwrap! (map-get? scheduled-payments { invoice-id: invoice-id }) err-not-found))
+      (retailer (get retailer invoice))
+      (supplier (get supplier invoice))
+      (amount (get amount scheduled-payment))
+      (retailer-balance (get balance (get-payment-account-balance retailer)))
+    )
+    (asserts! (>= stacks-block-height (get due-block scheduled-payment)) err-unauthorized)
+    (asserts! (not (get processed scheduled-payment)) err-already-claimed)
+    (asserts! (>= retailer-balance amount) err-insufficient-funds)
+    
+    (map-set retailer-payment-accounts
+      { retailer: retailer }
+      { balance: (- retailer-balance amount) }
+    )
+    
+    (map-set scheduled-payments
+      { invoice-id: invoice-id }
+      (merge scheduled-payment { processed: true })
+    )
+    
+    (map-set invoices
+      { invoice-id: invoice-id }
+      (merge invoice { status: "paid" })
+    )
+    
+    (ok true)
+  )
+)
+
+(define-public (cancel-scheduled-payment (invoice-id uint))
+  (let
+    (
+      (invoice (unwrap! (map-get? invoices { invoice-id: invoice-id }) err-not-found))
+      (scheduled-payment (unwrap! (map-get? scheduled-payments { invoice-id: invoice-id }) err-not-found))
+    )
+    (asserts! (is-eq tx-sender (get retailer invoice)) err-unauthorized)
+    (asserts! (not (get processed scheduled-payment)) err-already-claimed)
+    (asserts! (< stacks-block-height (get due-block scheduled-payment)) err-expired)
+    
+    (map-delete scheduled-payments { invoice-id: invoice-id })
+    
+    (map-set invoices
+      { invoice-id: invoice-id }
+      (merge invoice { status: "registered" })
+    )
+    
+    (ok true)
+  )
+)
