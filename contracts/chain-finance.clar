@@ -8,9 +8,15 @@
 (define-constant err-expired (err u106))
 (define-constant err-not-for-sale (err u107))
 (define-constant err-already-claimed (err u108))
+(define-constant err-no-insurance (err u110))
+(define-constant err-insurance-expired (err u111))
+(define-constant err-already-insured (err u112))
+(define-constant err-interest-not-enabled (err u113))
 
 (define-data-var platform-fee uint u5)
 (define-data-var next-invoice-id uint u1)
+(define-data-var insurance-pool uint u0)
+(define-data-var default-interest-rate uint u5)
 
 (define-map invoices
   { invoice-id: uint }
@@ -19,11 +25,14 @@
     supplier: principal,
     amount: uint,
     due-date: uint,
-    status: (string-ascii 20),
+    status: (string-ascii 25),
     tokenized: bool,
     for-sale: bool,
     sale-discount: uint,
-    buyer: (optional principal)
+    buyer: (optional principal),
+    interest-enabled: bool,
+    interest-rate: uint,
+    accrued-interest: uint
   }
 )
 
@@ -40,6 +49,17 @@
 (define-map claimed-invoices
   { invoice-id: uint }
   { claimed: bool }
+)
+
+(define-map invoice-insurance
+  { invoice-id: uint }
+  {
+    insured: bool,
+    premium-paid: uint,
+    coverage-amount: uint,
+    expires-at: uint,
+    policyowner: principal
+  }
 )
 
 (define-read-only (get-invoice (invoice-id uint))
@@ -67,11 +87,39 @@
   (var-get platform-fee)
 )
 
+(define-read-only (get-insurance-details (invoice-id uint))
+  (map-get? invoice-insurance { invoice-id: invoice-id })
+)
+
+(define-read-only (get-insurance-pool-balance)
+  (var-get insurance-pool)
+)
+
+(define-read-only (get-default-interest-rate)
+  (var-get default-interest-rate)
+)
+
+(define-read-only (calculate-insurance-premium (amount uint) (risk-factor uint))
+  (/ (* amount risk-factor) u1000)
+)
+
+(define-read-only (calculate-interest (principal-amount uint) (rate uint) (blocks-overdue uint))
+  (/ (* (* principal-amount rate) blocks-overdue) u36500)
+)
+
 (define-public (set-platform-fee (new-fee uint))
   (begin
     (asserts! (is-eq tx-sender contract-owner) err-owner-only)
     (asserts! (<= new-fee u100) err-invalid-amount)
     (ok (var-set platform-fee new-fee))
+  )
+)
+
+(define-public (set-default-interest-rate (new-rate uint))
+  (begin
+    (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+    (asserts! (<= new-rate u50) err-invalid-amount)
+    (ok (var-set default-interest-rate new-rate))
   )
 )
 
@@ -88,7 +136,10 @@
         tokenized: false,
         for-sale: false,
         sale-discount: u0,
-        buyer: none
+        buyer: none,
+        interest-enabled: false,
+        interest-rate: u0,
+        accrued-interest: u0
       })
     )
     (asserts! (> amount u0) err-invalid-amount)
@@ -498,5 +549,136 @@
     )
     
     (ok true)
+  )
+)
+
+(define-public (purchase-invoice-insurance (invoice-id uint) (coverage-percent uint))
+  (let
+    (
+      (invoice (unwrap! (map-get? invoices { invoice-id: invoice-id }) err-not-found))
+      (invoice-amount (get amount invoice))
+      (coverage-amount (/ (* invoice-amount coverage-percent) u100))
+      (retailer-rating (get-retailer-rating (get retailer invoice)))
+      (risk-factor (if (> (get rating-count retailer-rating) u0)
+                      (+ u10 (- u50 (* (/ (get total-score retailer-rating) (get rating-count retailer-rating)) u10)))
+                      u30))
+      (premium (calculate-insurance-premium coverage-amount risk-factor))
+      (policy-duration (+ stacks-block-height u144))
+    )
+    (asserts! (is-some (get buyer invoice)) err-unauthorized)
+    (asserts! (is-eq tx-sender (unwrap-panic (get buyer invoice))) err-unauthorized)
+    (asserts! (is-none (map-get? invoice-insurance { invoice-id: invoice-id })) err-already-insured)
+    (asserts! (<= coverage-percent u100) err-invalid-amount)
+    (asserts! (> coverage-percent u0) err-invalid-amount)
+    
+    (map-set invoice-insurance
+      { invoice-id: invoice-id }
+      {
+        insured: true,
+        premium-paid: premium,
+        coverage-amount: coverage-amount,
+        expires-at: policy-duration,
+        policyowner: tx-sender
+      }
+    )
+    
+    (var-set insurance-pool (+ (var-get insurance-pool) premium))
+    (ok premium)
+  )
+)
+
+(define-public (claim-insurance-payout (invoice-id uint))
+  (let
+    (
+      (invoice (unwrap! (map-get? invoices { invoice-id: invoice-id }) err-not-found))
+      (insurance (unwrap! (map-get? invoice-insurance { invoice-id: invoice-id }) err-no-insurance))
+      (coverage-amount (get coverage-amount insurance))
+      (pool-balance (var-get insurance-pool))
+    )
+    (asserts! (is-eq tx-sender (get policyowner insurance)) err-unauthorized)
+    (asserts! (>= stacks-block-height (get due-date invoice)) err-unauthorized)
+    (asserts! (< stacks-block-height (get expires-at insurance)) err-insurance-expired)
+    (asserts! (not (default-to false (get claimed (map-get? claimed-invoices { invoice-id: invoice-id })))) err-already-claimed)
+    (asserts! (>= pool-balance coverage-amount) err-insufficient-funds)
+    
+    (map-set claimed-invoices { invoice-id: invoice-id } { claimed: true })
+    (var-set insurance-pool (- pool-balance coverage-amount))
+    
+    (map-set investor-balances
+      { investor: tx-sender }
+      { balance: (+ (get balance (get-investor-balance tx-sender)) coverage-amount) }
+    )
+    
+    (ok coverage-amount)
+  )
+)
+
+(define-public (enable-interest (invoice-id uint) (custom-rate uint))
+  (let
+    (
+      (invoice (unwrap! (map-get? invoices { invoice-id: invoice-id }) err-not-found))
+      (interest-rate (if (> custom-rate u0) custom-rate (var-get default-interest-rate)))
+    )
+    (asserts! (is-eq tx-sender (get retailer invoice)) err-unauthorized)
+    (asserts! (not (get interest-enabled invoice)) err-already-exists)
+    (asserts! (<= interest-rate u50) err-invalid-amount)
+    (map-set invoices
+      { invoice-id: invoice-id }
+      (merge invoice { 
+        interest-enabled: true,
+        interest-rate: interest-rate 
+      })
+    )
+    (ok true)
+  )
+)
+
+(define-public (calculate-and-update-interest (invoice-id uint))
+  (let
+    (
+      (invoice (unwrap! (map-get? invoices { invoice-id: invoice-id }) err-not-found))
+      (current-block stacks-block-height)
+      (due-date (get due-date invoice))
+      (blocks-overdue (if (> current-block due-date) (- current-block due-date) u0))
+      (principal-amount (get amount invoice))
+      (interest-rate (get interest-rate invoice))
+      (new-interest (calculate-interest principal-amount interest-rate blocks-overdue))
+    )
+    (asserts! (get interest-enabled invoice) err-interest-not-enabled)
+    (asserts! (> current-block due-date) err-unauthorized)
+    (map-set invoices
+      { invoice-id: invoice-id }
+      (merge invoice { accrued-interest: new-interest })
+    )
+    (ok new-interest)
+  )
+)
+
+(define-public (claim-invoice-with-interest (invoice-id uint))
+  (let
+    (
+      (invoice (unwrap! (map-get? invoices { invoice-id: invoice-id }) err-not-found))
+      (buyer (unwrap! (get buyer invoice) err-unauthorized))
+      (principal-amount (get amount invoice))
+      (accrued-interest (get accrued-interest invoice))
+      (total-amount (+ principal-amount accrued-interest))
+    )
+    (asserts! (is-eq tx-sender buyer) err-unauthorized)
+    (asserts! (>= stacks-block-height (get due-date invoice)) err-unauthorized)
+    (asserts! (not (default-to false (get claimed (map-get? claimed-invoices { invoice-id: invoice-id })))) err-already-claimed)
+    
+    (map-set claimed-invoices { invoice-id: invoice-id } { claimed: true })
+    
+    (map-set invoices
+      { invoice-id: invoice-id }
+      (merge invoice { status: "claimed-with-interest" })
+    )
+    
+    (map-set investor-balances
+      { investor: tx-sender }
+      { balance: (+ (get balance (get-investor-balance tx-sender)) total-amount) }
+    )
+    
+    (ok total-amount)
   )
 )
