@@ -12,11 +12,14 @@
 (define-constant err-insurance-expired (err u111))
 (define-constant err-already-insured (err u112))
 (define-constant err-interest-not-enabled (err u113))
+(define-constant err-credit-limit-exceeded (err u114))
+(define-constant err-insufficient-credit-score (err u115))
 
 (define-data-var platform-fee uint u5)
 (define-data-var next-invoice-id uint u1)
 (define-data-var insurance-pool uint u0)
 (define-data-var default-interest-rate uint u5)
+(define-data-var minimum-credit-score uint u300)
 
 (define-map invoices
   { invoice-id: uint }
@@ -33,6 +36,31 @@
     interest-enabled: bool,
     interest-rate: uint,
     accrued-interest: uint
+  }
+)
+
+;; Credit scoring and payment history tracking
+(define-map retailer-credit-profiles
+  { retailer: principal }
+  {
+    total-invoices: uint,
+    paid-on-time: uint,
+    late-payments: uint,
+    defaults: uint,
+    total-volume: uint,
+    credit-score: uint,
+    last-updated: uint
+  }
+)
+
+;; Credit tier privileges based on scores
+(define-map credit-tiers
+  { tier: uint }
+  {
+    min-score: uint,
+    max-discount: uint,
+    max-invoice-amount: uint,
+    insurance-discount: uint
   }
 )
 
@@ -107,6 +135,137 @@
   (/ (* (* principal-amount rate) blocks-overdue) u36500)
 )
 
+;; Credit scoring system read-only functions
+(define-read-only (get-credit-profile (retailer principal))
+  (default-to
+    { 
+      total-invoices: u0,
+      paid-on-time: u0,
+      late-payments: u0,
+      defaults: u0,
+      total-volume: u0,
+      credit-score: u500,
+      last-updated: u0
+    }
+    (map-get? retailer-credit-profiles { retailer: retailer })
+  )
+)
+
+(define-read-only (get-credit-tier (tier uint))
+  (map-get? credit-tiers { tier: tier })
+)
+
+(define-read-only (calculate-credit-score (profile (tuple (total-invoices uint) (paid-on-time uint) (late-payments uint) (defaults uint) (total-volume uint) (credit-score uint) (last-updated uint))))
+  (let
+    (
+      (total-invoices (get total-invoices profile))
+      (paid-on-time (get paid-on-time profile))
+      (late-payments (get late-payments profile))
+      (defaults (get defaults profile))
+      (total-volume (get total-volume profile))
+    )
+    (if (is-eq total-invoices u0)
+      u500  ;; Default score for new retailers
+      (let
+        (
+          (on-time-rate (/ (* paid-on-time u100) total-invoices))
+          (default-penalty (if (> defaults u0) (* defaults u50) u0))
+          (late-penalty (* late-payments u10))
+          (volume-bonus (if (> total-volume u10000) u50 u0))
+          (base-score (+ u300 (* on-time-rate u4)))
+        )
+        (if (>= (- (+ base-score volume-bonus) (+ default-penalty late-penalty)) u850)
+          u850
+          (if (<= (- (+ base-score volume-bonus) (+ default-penalty late-penalty)) u300)
+            u300
+            (- (+ base-score volume-bonus) (+ default-penalty late-penalty))
+          )
+        )
+      )
+    )
+  )
+)
+
+(define-read-only (get-retailer-credit-tier (retailer principal))
+  (let
+    (
+      (credit-score (get credit-score (get-credit-profile retailer)))
+    )
+    (if (>= credit-score u750) u4
+      (if (>= credit-score u650) u3
+        (if (>= credit-score u550) u2
+          (if (>= credit-score u450) u1 u0)
+        )
+      )
+    )
+  )
+)
+
+(define-read-only (get-max-discount-for-retailer (retailer principal))
+  (let
+    (
+      (tier (get-retailer-credit-tier retailer))
+      (tier-info (get-credit-tier tier))
+    )
+    (match tier-info
+      info (get max-discount info)
+      u10  ;; Default 10% for unrated retailers
+    )
+  )
+)
+
+;; Initialize credit tier system - only owner can set these
+(define-public (initialize-credit-tiers)
+  (begin
+    (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+    ;; Tier 0: Poor credit (300-449)
+    (map-set credit-tiers { tier: u0 } { min-score: u300, max-discount: u5, max-invoice-amount: u1000, insurance-discount: u0 })
+    ;; Tier 1: Fair credit (450-549)
+    (map-set credit-tiers { tier: u1 } { min-score: u450, max-discount: u15, max-invoice-amount: u5000, insurance-discount: u5 })
+    ;; Tier 2: Good credit (550-649)
+    (map-set credit-tiers { tier: u2 } { min-score: u550, max-discount: u25, max-invoice-amount: u15000, insurance-discount: u10 })
+    ;; Tier 3: Very good credit (650-749)
+    (map-set credit-tiers { tier: u3 } { min-score: u650, max-discount: u40, max-invoice-amount: u50000, insurance-discount: u15 })
+    ;; Tier 4: Excellent credit (750+)
+    (map-set credit-tiers { tier: u4 } { min-score: u750, max-discount: u60, max-invoice-amount: u100000, insurance-discount: u20 })
+    (ok true)
+  )
+)
+
+;; Update credit profile when payment events occur
+(define-public (record-payment-event (retailer principal) (invoice-amount uint) (payment-type (string-ascii 10)))
+  (let
+    (
+      (current-profile (get-credit-profile retailer))
+      (total-invoices (get total-invoices current-profile))
+      (paid-on-time (get paid-on-time current-profile))
+      (late-payments (get late-payments current-profile))
+      (defaults (get defaults current-profile))
+      (total-volume (get total-volume current-profile))
+      (new-total-invoices (+ total-invoices u1))
+      (new-total-volume (+ total-volume invoice-amount))
+      (new-paid-on-time (if (is-eq payment-type "on-time") (+ paid-on-time u1) paid-on-time))
+      (new-late-payments (if (is-eq payment-type "late") (+ late-payments u1) late-payments))
+      (new-defaults (if (is-eq payment-type "default") (+ defaults u1) defaults))
+      (updated-profile {
+        total-invoices: new-total-invoices,
+        paid-on-time: new-paid-on-time,
+        late-payments: new-late-payments,
+        defaults: new-defaults,
+        total-volume: new-total-volume,
+        credit-score: u0,
+        last-updated: stacks-block-height
+      })
+      (new-score (calculate-credit-score updated-profile))
+    )
+    (map-set retailer-credit-profiles
+      { retailer: retailer }
+      (merge updated-profile { credit-score: new-score })
+    )
+    (ok new-score)
+  )
+)
+
 (define-public (set-platform-fee (new-fee uint))
   (begin
     (asserts! (is-eq tx-sender contract-owner) err-owner-only)
@@ -144,6 +303,8 @@
     )
     (asserts! (> amount u0) err-invalid-amount)
     (asserts! (> due-date stacks-block-height) err-invalid-amount)
+    ;; Enforce credit-based invoice amount limits
+    (unwrap-panic (validate-invoice-credit-limit tx-sender amount))
     (map-set invoices { invoice-id: invoice-id } new-invoice)
     (var-set next-invoice-id (+ invoice-id u1))
     (ok invoice-id)
@@ -169,10 +330,13 @@
   (let
     (
       (invoice (unwrap! (map-get? invoices { invoice-id: invoice-id }) err-not-found))
+      (retailer (get retailer invoice))
+      (max-allowed-discount (get-max-discount-for-retailer retailer))
     )
-    (asserts! (is-eq tx-sender (get retailer invoice)) err-unauthorized)
+    (asserts! (is-eq tx-sender retailer) err-unauthorized)
     (asserts! (get tokenized invoice) err-unauthorized)
     (asserts! (< discount u100) err-invalid-amount)
+    (asserts! (<= discount max-allowed-discount) err-credit-limit-exceeded)
     (map-set invoices
       { invoice-id: invoice-id }
       (merge invoice { 
@@ -527,6 +691,9 @@
       (merge invoice { status: "paid" })
     )
     
+    ;; Record on-time payment for credit score
+    (unwrap-panic (record-payment-event retailer amount "on-time"))
+    
     (ok true)
   )
 )
@@ -682,3 +849,75 @@
     (ok total-amount)
   )
 )
+
+;; Enhanced insurance pricing based on credit score
+(define-public (purchase-credit-based-insurance (invoice-id uint) (coverage-percent uint))
+  (let
+    (
+      (invoice (unwrap! (map-get? invoices { invoice-id: invoice-id }) err-not-found))
+      (retailer (get retailer invoice))
+      (invoice-amount (get amount invoice))
+      (coverage-amount (/ (* invoice-amount coverage-percent) u100))
+      (credit-profile (get-credit-profile retailer))
+      (credit-score (get credit-score credit-profile))
+      (tier (get-retailer-credit-tier retailer))
+      (tier-info (get-credit-tier tier))
+      (insurance-discount (match tier-info info (get insurance-discount info) u0))
+      (base-risk-factor (if (>= credit-score u700) u15
+                         (if (>= credit-score u600) u25
+                           (if (>= credit-score u500) u35 u50))))
+      (adjusted-risk-factor (if (> insurance-discount u0) 
+                              (- base-risk-factor (/ (* base-risk-factor insurance-discount) u100))
+                              base-risk-factor))
+      (premium (calculate-insurance-premium coverage-amount adjusted-risk-factor))
+      (policy-duration (+ stacks-block-height u144))
+    )
+    (asserts! (is-some (get buyer invoice)) err-unauthorized)
+    (asserts! (is-eq tx-sender (unwrap-panic (get buyer invoice))) err-unauthorized)
+    (asserts! (is-none (map-get? invoice-insurance { invoice-id: invoice-id })) err-already-insured)
+    (asserts! (<= coverage-percent u100) err-invalid-amount)
+    (asserts! (> coverage-percent u0) err-invalid-amount)
+    
+    (map-set invoice-insurance
+      { invoice-id: invoice-id }
+      {
+        insured: true,
+        premium-paid: premium,
+        coverage-amount: coverage-amount,
+        expires-at: policy-duration,
+        policyowner: tx-sender
+      }
+    )
+    
+    (var-set insurance-pool (+ (var-get insurance-pool) premium))
+    (ok premium)
+  )
+)
+
+;; Manually record late payment or default (for admin/oracle use)
+(define-public (record-late-payment-or-default (retailer principal) (invoice-amount uint) (is-default bool))
+  (let
+    (
+      (payment-type (if is-default "default" "late"))
+    )
+    (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+    (unwrap-panic (record-payment-event retailer invoice-amount payment-type))
+    (ok true)
+  )
+)
+
+;; Credit score based invoice amount validation
+(define-public (validate-invoice-credit-limit (retailer principal) (amount uint))
+  (let
+    (
+      (tier (get-retailer-credit-tier retailer))
+      (tier-info (get-credit-tier tier))
+      (max-amount (match tier-info info (get max-invoice-amount info) u1000))
+    )
+    (asserts! (<= amount max-amount) err-credit-limit-exceeded)
+    (ok true)
+  )
+)
+
+
+
